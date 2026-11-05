@@ -110,3 +110,64 @@ as much as between repetitions (README: "absolute latency and throughput are box
 `proxy/proxy_test.go`, `proxy/redis_test.go` (new), `cmd/hkproxy/main.go`, `cmd/hkproxy/main_test.go` (new),
 `cmd/hkload/main.go`, `cmd/hkload/tracking.go`, `.github/workflows/ci.yml` (new), `.golangci.yml` (new),
 `README.md`, `IMPROVEMENTS.md` (new).
+
+## Round 2 (2026-11-05): backend reply timeout
+
+Stacked on round 1 (`improve/round-1`).
+
+### What changed
+
+1. **Bug: a shard that stopped answering hung its clients forever.** Backend connections had no reply deadline,
+   so a stopped or wedged Redis process, or a half-open TCP connection, blocked every request routed to that
+   shard (and, through RESP's in-order replies, everything pipelined behind it on the client's connection).
+   `backend.Options.ReadTimeout` (via the new `backend.NewServerOptions`) closes a connection when it has
+   requests outstanding and no reply has arrived for that long; the outstanding calls fail with an error wrapping
+   `backend.ErrTimeout` and the connection is re-established. Idle connections are never timed out.
+   `proxy.Config.BackendTimeout` / `hkproxy -backend-timeout` default to 5 s (0 = wait forever, the old
+   behaviour); the seed connection used for `CLUSTER SLOTS` uses it too. `NewServer` and `NewServerInit` keep
+   no timeout, so `hkload` is unchanged.
+2. **Implementation chosen by measurement.** The first version reset `SetReadDeadline` after every reply; in E1 it
+   cost about 5% of proxy CPU (12,338 / 12,415 / 12,715 requests per proxy CPU-second against 13,063 / 12,853 /
+   13,029 on main). It was replaced by a per-connection watchdog that checks every `timeout/4`; the hot path
+   only does two atomic stores per reply, and the numbers are back within noise (below).
+3. The fake Redis in the proxy tests now reads its gate under its mutex (the round 1 version read it unlocked).
+
+### How it was verified
+
+Live, 3-shard cluster from `bench/cluster.sh`, the shard owning `k2` frozen with `kill -STOP`:
+
+```
+main:   GET while shard stopped -> rc=124 '' after 15.01 s (killed by `timeout 15`); after SIGCONT -> 'v'
+branch: GET while shard stopped -> rc=0 'ERR proxy: backend reply timeout after 1s (127.0.0.1:7001)' after 1.24 s; after SIGCONT -> 'v'
+```
+
+(`hkproxy -backend-timeout 1s` on the branch.) Tests: `TestReadTimeoutFailsOutstandingCalls` (a server that stops
+answering; the call behind the stuck one fails too; an idle connection survives a pause longer than the timeout;
+the pool reconnects), `TestNoReadTimeoutByDefault`, `TestBackendTimeoutBecomesErrorReply` (through the proxy).
+
+E1 at s = 2.0, hot-key proxy, 3 repetitions, same command as round 1 (median; per-rep requests per proxy CPU-second):
+
+| | main | round 1 | this round |
+|---|---|---|---|
+| calls on the hottest shard | 40,752 | 40,749 | 40,756 |
+| max / mean shard load | 1.39 | 1.39 | 1.39 |
+| read hit ratio | 0.86 | 0.86 | 0.86 |
+| lost writes, errors | 0, 0 | 0, 0 | 0, 0 |
+| p50 / p99 | 0.25 / 1.58 ms | 0.25 / 2.08 ms | 0.25 / 2.07 ms |
+| req per proxy CPU-s | 13,063 / 12,853 / 13,029 | 12,903 / 12,953 / 12,953 | 13,236 / 13,004 / 12,723 |
+
+```
+$ go test -count=1 -v ./... | grep -E '^--- ' | awk '{print $2}' | sort | uniq -c    # round 1 -> this round
+     28 PASS: -> 31 PASS:
+$ go test -race -count=5 ./backend ./proxy ; golangci-lint run ./...    # ok; 0 issues
+```
+
+### Not verified
+
+Only E1 at s = 2.0 was re-run (as in round 1); the README's req/CPU-s figures still differ from this VM for main
+too (see round 1).
+
+### Files touched
+
+`backend/backend.go`, `backend/backend_test.go`, `proxy/proxy.go`, `proxy/proxy_test.go`, `cmd/hkproxy/main.go`,
+`README.md`, `IMPROVEMENTS.md`.

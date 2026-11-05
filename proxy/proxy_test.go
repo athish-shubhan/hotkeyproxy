@@ -63,8 +63,11 @@ func (f *fakeRedis) serve(c net.Conn) {
 		}
 		f.calls.Add(1)
 		cmd := strings.ToUpper(string(args[0]))
-		if f.gate != nil && cmd != "CLUSTER" {
-			<-f.gate
+		f.mu.Lock()
+		gate := f.gate
+		f.mu.Unlock()
+		if gate != nil && cmd != "CLUSTER" {
+			<-gate
 		}
 		f.mu.Lock()
 		if cmd == "GET" {
@@ -257,7 +260,10 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 		c.Isolation = true
 		c.MaxInFlight = 1
 	})
-	f.gate = make(chan struct{})
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.gate = gate
+	f.mu.Unlock()
 	noisy, victim := p.tenant("noisy"), p.tenant("victim")
 	q := p.fq[0]
 	var chans []<-chan backend.Result
@@ -265,7 +271,7 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 		chans = append(chans, q.submit(noisy, 8, resp.AppendCommand(nil, []byte("GET"), []byte(fmt.Sprint("n", i))))) // heavy: 8 RU each
 	}
 	chans = append(chans, q.submit(victim, 1, resp.AppendCommand(nil, []byte("GET"), []byte("victim"))))
-	close(f.gate)
+	close(gate)
 	for _, ch := range chans {
 		if r := <-ch; r.Err != nil {
 			t.Fatal(r.Err)
@@ -311,5 +317,43 @@ func TestTenantReserve(t *testing.T) {
 	// after 1 s the bucket has earned 100 RU back: debt 20 RU, so 80 RU are free
 	if w, ok := tn.reserve(80, now.Add(time.Second), 200*time.Millisecond); !ok || w != 0 {
 		t.Fatalf("after refill: wait %v ok %v", w, ok)
+	}
+}
+
+// A shard that stops answering turns into an error reply after
+// BackendTimeout instead of a client that waits forever, and requests work
+// again once the shard answers.
+func TestBackendTimeoutBecomesErrorReply(t *testing.T) {
+	f := startFake(t)
+	p := newProxy(t, f, func(c *Config) {
+		c.Hot = false
+		c.BackendTimeout = 200 * time.Millisecond
+	})
+	if got := string(do(p, "GET", "k")); strings.HasPrefix(got, "-") {
+		t.Fatalf("healthy shard: %q", got)
+	}
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.gate = gate
+	f.mu.Unlock()
+	start := time.Now()
+	got := string(do(p, "GET", "k"))
+	if !strings.HasPrefix(got, "-ERR proxy: backend reply timeout") {
+		t.Fatalf("got %q", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %v", d)
+	}
+	f.mu.Lock()
+	f.gate = nil
+	f.mu.Unlock()
+	close(gate)
+	var ok bool
+	for i := 0; i < 50 && !ok; i++ { // the shard connection is re-established
+		ok = !strings.HasPrefix(string(do(p, "GET", "k")), "-")
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("requests did not recover after the shard answered again")
 	}
 }

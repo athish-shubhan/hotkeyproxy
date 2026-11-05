@@ -78,6 +78,8 @@ curl -s 127.0.0.1:7200                     # proxy stats (JSON)
 bench/cluster.sh stop
 ```
 
+A shard that stops answering turns into `ERR proxy: backend reply timeout` after `-backend-timeout` (default 5s) and its connection is re-established, instead of every request to it waiting forever.
+
 CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, `go test -race` with Redis 7 installed, and golangci-lint on every pull request.
 
 ## Reproduce

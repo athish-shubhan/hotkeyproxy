@@ -59,12 +59,15 @@ type Config struct {
 	// connection), and is refused if it would wait longer than MaxQuotaWait.
 	QuotaShape   bool
 	MaxQuotaWait time.Duration
+	// BackendTimeout fails requests whose shard has not replied for this
+	// long (the shard connection is then re-established); 0 = wait forever.
+	BackendTimeout time.Duration
 }
 
 func DefaultConfig() Config {
 	return Config{Listen: "127.0.0.1:7100", StatsAddr: "127.0.0.1:7200", Seed: "127.0.0.1:7001", ConnsPerShard: 4,
 		Hot: true, HotThreshold: 200, HalfLife: time.Second, Staleness: 50 * time.Millisecond, CacheEntries: 4096,
-		CombineWindow: 0, Sample: 1, MaxInFlight: 16}
+		CombineWindow: 0, Sample: 1, MaxInFlight: 16, BackendTimeout: 5 * time.Second}
 }
 
 type Stats struct {
@@ -142,6 +145,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("proxy: MaxInFlight must be at least 1 with isolation")
 	case c.QuotaShape && !c.Isolation:
 		return fmt.Errorf("proxy: QuotaShape needs Isolation")
+	case c.BackendTimeout < 0:
+		return fmt.Errorf("proxy: negative BackendTimeout")
 	}
 	for _, t := range c.Tenants {
 		if t.Name == "" || t.QuotaRU < 0 || t.Weight <= 0 {
@@ -155,7 +160,7 @@ func New(cfg Config) (*Proxy, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	seed := backend.NewServer(cfg.Seed, 1)
+	seed := backend.NewServerOptions(cfg.Seed, 1, backend.Options{ReadTimeout: cfg.BackendTimeout})
 	rep, err := seed.Do(resp.AppendCommand(nil, []byte("CLUSTER"), []byte("SLOTS")))
 	seed.Close() // only needed for the slot map; it used to reconnect forever
 	if err != nil {
@@ -167,7 +172,7 @@ func New(cfg Config) (*Proxy, error) {
 	}
 	p := &Proxy{cfg: cfg, slots: m}
 	for _, a := range m.Addrs {
-		p.servers = append(p.servers, backend.NewServer(a, cfg.ConnsPerShard))
+		p.servers = append(p.servers, backend.NewServerOptions(a, cfg.ConnsPerShard, backend.Options{ReadTimeout: cfg.BackendTimeout}))
 	}
 	p.tenants = map[string]*Tenant{}
 	for i, sv := range p.servers {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -24,6 +25,8 @@ type echoServer struct {
 	dropAfter int64
 	mu        sync.Mutex
 	first     []string // first command seen on each connection
+	// a command named HANG gets no reply, and nothing after it on that
+	// connection is answered (a stopped or wedged server)
 }
 
 func startEcho(t *testing.T, dropAfter int64) *echoServer {
@@ -68,6 +71,11 @@ func (e *echoServer) serve(c net.Conn) {
 		}
 		n++
 		e.cmds.Add(1)
+		if parts[0] == "HANG" {
+			_ = w.Flush()
+			_, _ = io.Copy(io.Discard, c) // read and ignore until the client closes
+			return
+		}
 		_, _ = w.Write(resp.AppendBulk(nil, []byte(strings.Join(parts, " "))))
 		if r.Buffered() == 0 {
 			if w.Flush() != nil {
@@ -218,5 +226,57 @@ func TestZeroConnsMeansOne(t *testing.T) {
 	defer s.Close()
 	if rep, err := s.Do(cmd("PING")); err != nil || string(rep.Str) != "PING" {
 		t.Fatalf("%q %v", rep.Str, err)
+	}
+}
+
+// A server that stops answering fails the outstanding calls with ErrTimeout
+// after ReadTimeout instead of blocking them forever, and the pool recovers.
+func TestReadTimeoutFailsOutstandingCalls(t *testing.T) {
+	e := startEcho(t, 0)
+	s := NewServerOptions(e.ln.Addr().String(), 1, Options{ReadTimeout: 200 * time.Millisecond})
+	defer s.Close()
+	if _, err := s.Do(cmd("PING")); err != nil {
+		t.Fatal(err)
+	}
+	// idle longer than the timeout: an idle connection must not be closed
+	time.Sleep(400 * time.Millisecond)
+	if rep, err := s.Do(cmd("PING")); err != nil || string(rep.Str) != "PING" {
+		t.Fatalf("after idling: %q %v", rep.Str, err)
+	}
+	conns := e.conns.Load()
+	start := time.Now()
+	hang := s.Go(cmd("HANG"))
+	behind := s.Go(cmd("PING")) // queued behind it on the same connection
+	for _, ch := range []<-chan Result{hang, behind} {
+		select {
+		case r := <-ch:
+			if !errors.Is(r.Err, ErrTimeout) {
+				t.Fatalf("want ErrTimeout, got %v", r.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("call to a server that stopped answering hung")
+		}
+	}
+	if d := time.Since(start); d < 150*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("timed out after %v, want about 200ms", d)
+	}
+	if rep, err := s.Do(cmd("PING")); err != nil || string(rep.Str) != "PING" {
+		t.Fatalf("after the timeout the pool should reconnect: %q %v", rep.Str, err)
+	}
+	if e.conns.Load() <= conns {
+		t.Fatal("expected a new connection")
+	}
+}
+
+// Without a ReadTimeout (the default for NewServer) behaviour is unchanged.
+func TestNoReadTimeoutByDefault(t *testing.T) {
+	e := startEcho(t, 0)
+	s := NewServer(e.ln.Addr().String(), 1)
+	defer s.Close()
+	ch := s.Go(cmd("HANG"))
+	select {
+	case r := <-ch:
+		t.Fatalf("returned %v without a timeout configured", r)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
