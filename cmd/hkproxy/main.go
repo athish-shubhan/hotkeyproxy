@@ -18,6 +18,7 @@ func main() {
 	flag.StringVar(&c.StatsAddr, "stats", c.StatsAddr, "HTTP stats address (empty = off)")
 	flag.StringVar(&c.Seed, "seed", c.Seed, "any Redis Cluster node")
 	flag.IntVar(&c.ConnsPerShard, "conns", c.ConnsPerShard, "pipelined connections per shard")
+	flag.DurationVar(&c.BackendTimeout, "backend-timeout", c.BackendTimeout, "fail requests when a shard has not replied for this long (0 = wait forever)")
 	flag.BoolVar(&c.Hot, "hot", c.Hot, "hot-key handling (false = plain proxy)")
 	flag.Float64Var(&c.HotThreshold, "threshold", c.HotThreshold, "decayed accesses for a key to be hot")
 	flag.DurationVar(&c.HalfLife, "half-life", c.HalfLife, "sketch decay half-life")
