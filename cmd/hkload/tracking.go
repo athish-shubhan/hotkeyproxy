@@ -54,12 +54,16 @@ func newTrackingClient(m *cluster.Map, conns int) (*trackingClient, error) {
 			return nil, err
 		}
 		r := resp.NewReader(bufio.NewReader(nc))
-		nc.Write(resp.AppendCommand(nil, []byte("CLIENT"), []byte("ID")))
+		if _, err := nc.Write(resp.AppendCommand(nil, []byte("CLIENT"), []byte("ID"))); err != nil {
+			return nil, err
+		}
 		idr, err := r.ReadReply()
 		if err != nil {
 			return nil, err
 		}
-		nc.Write(resp.AppendCommand(nil, []byte("SUBSCRIBE"), []byte("__redis__:invalidate")))
+		if _, err := nc.Write(resp.AppendCommand(nil, []byte("SUBSCRIBE"), []byte("__redis__:invalidate"))); err != nil {
+			return nil, err
+		}
 		if _, err := r.ReadReply(); err != nil {
 			return nil, err
 		}

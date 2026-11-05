@@ -20,6 +20,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -122,9 +123,41 @@ func (p *Proxy) tenant(name string) *Tenant {
 	return t
 }
 
+// Validate reports settings that would make the proxy misbehave instead of
+// fail: Sample 0 means no key is ever hot, ConnsPerShard 0 used to divide by
+// zero on the first request.
+func (c Config) Validate() error {
+	switch {
+	case c.Seed == "":
+		return fmt.Errorf("proxy: no seed node")
+	case c.ConnsPerShard < 1:
+		return fmt.Errorf("proxy: ConnsPerShard must be at least 1, got %d", c.ConnsPerShard)
+	case c.Sample < 1:
+		return fmt.Errorf("proxy: Sample must be at least 1, got %d", c.Sample)
+	case c.Hot && (c.HotThreshold <= 0 || c.HalfLife <= 0 || c.Staleness <= 0 || c.CacheEntries < 1):
+		return fmt.Errorf("proxy: hot-key handling needs HotThreshold, HalfLife, Staleness and CacheEntries > 0")
+	case c.CombineWindow < 0:
+		return fmt.Errorf("proxy: negative CombineWindow")
+	case c.Isolation && c.MaxInFlight < 1:
+		return fmt.Errorf("proxy: MaxInFlight must be at least 1 with isolation")
+	case c.QuotaShape && !c.Isolation:
+		return fmt.Errorf("proxy: QuotaShape needs Isolation")
+	}
+	for _, t := range c.Tenants {
+		if t.Name == "" || t.QuotaRU < 0 || t.Weight <= 0 {
+			return fmt.Errorf("proxy: tenant %q needs a name, QuotaRU >= 0 and Weight > 0", t.Name)
+		}
+	}
+	return nil
+}
+
 func New(cfg Config) (*Proxy, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	seed := backend.NewServer(cfg.Seed, 1)
 	rep, err := seed.Do(resp.AppendCommand(nil, []byte("CLUSTER"), []byte("SLOTS")))
+	seed.Close() // only needed for the slot map; it used to reconnect forever
 	if err != nil {
 		return nil, err
 	}
@@ -157,7 +190,18 @@ func (p *Proxy) ListenAndServe() error {
 		mux.HandleFunc("/", p.statsHandler)
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		go http.ListenAndServe(p.cfg.StatsAddr, mux)
+		// Bind before serving clients: a taken stats port used to be
+		// ignored silently, and the benchmark then read no stats.
+		sl, err := net.Listen("tcp", p.cfg.StatsAddr)
+		if err != nil {
+			return fmt.Errorf("stats listener: %w", err)
+		}
+		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := srv.Serve(sl); err != nil {
+				log.Printf("stats server: %v", err)
+			}
+		}()
 	}
 	ln, err := net.Listen("tcp", p.cfg.Listen)
 	if err != nil {
@@ -169,7 +213,7 @@ func (p *Proxy) ListenAndServe() error {
 			return err
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
+			_ = tc.SetNoDelay(true) // Go's default already; best effort
 		}
 		go p.serve(c)
 	}

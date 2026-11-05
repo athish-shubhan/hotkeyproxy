@@ -64,6 +64,22 @@ cmd/hkload   open-loop load generator: live-room and leaderboard mixes, direct /
 bench/     cluster.sh (3-shard Redis Cluster), run_all.sh, plot.py
 ```
 
+## Quick start
+
+Needs Go 1.24+, and `redis-server` 7 with `redis-cli` for the cluster:
+
+```
+git clone https://github.com/athish-shubhan/hotkeyproxy && cd hotkeyproxy
+go test -race ./...                        # TestAgainstRealRedis runs when redis-server is on PATH, skips otherwise
+bench/cluster.sh start                     # 3-shard Redis Cluster on 127.0.0.1:7001-7003
+go run ./cmd/hkproxy -seed 127.0.0.1:7001  # proxy on 127.0.0.1:7100, stats on 127.0.0.1:7200
+redis-cli -p 7100 INCR room:1:likes        # in another shell
+curl -s 127.0.0.1:7200                     # proxy stats (JSON)
+bench/cluster.sh stop
+```
+
+CI (`.github/workflows/ci.yml`) runs gofmt, `go vet`, `go test -race` with Redis 7 installed, and golangci-lint on every pull request.
+
 ## Reproduce
 
 ```

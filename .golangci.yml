@@ -1,0 +1,12 @@
+version: "2"
+linters:
+  exclusions:
+    # Unchecked Close/Fprint*/Flush errors are the conventional exceptions.
+    presets:
+      - std-error-handling
+    rules:
+      # Tests fail on the assertion that follows; an unchecked error there
+      # only makes the failure message less direct.
+      - path: _test\.go
+        linters:
+          - errcheck
