@@ -84,10 +84,22 @@ func (s *Server) Do(cmd []byte) (resp.Reply, error) {
 	return r.Reply, r.Err
 }
 
-// Go sends an encoded command and returns a channel for its single reply.
-// cmd must not be modified until the reply arrives. After Close the reply
-// is an error.
+// Go sends an encoded command on the next connection (round robin) and
+// returns a channel for its single reply. Two calls may use different
+// connections, so Redis may run them in either order; use GoLane when order
+// matters. cmd must not be modified until the reply arrives. After Close the
+// reply is an error.
 func (s *Server) Go(cmd []byte) <-chan Result {
+	return s.goOn(s.next.Add(1), cmd)
+}
+
+// GoLane is Go on the connection chosen by lane: calls with the same lane use
+// the same connection and so run on Redis in the order they were made.
+func (s *Server) GoLane(lane uint64, cmd []byte) <-chan Result {
+	return s.goOn(lane, cmd)
+}
+
+func (s *Server) goOn(n uint64, cmd []byte) <-chan Result {
 	c := &call{cmd: cmd, done: make(chan Result, 1)}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -98,7 +110,7 @@ func (s *Server) Go(cmd []byte) <-chan Result {
 	s.Calls.Add(1)
 	// Queued before Close takes the lock, so the connection loop either
 	// serves it or fails it when it drains on exit.
-	s.conns[s.next.Add(1)%uint64(len(s.conns))].in <- c
+	s.conns[n%uint64(len(s.conns))].in <- c
 	return c.done
 }
 

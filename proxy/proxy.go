@@ -99,6 +99,7 @@ type Proxy struct {
 	comb    *combiner
 	S       Stats
 	sampleN atomic.Uint64
+	laneSeq atomic.Uint64 // one lane per client connection
 
 	tmu     sync.Mutex
 	tenants map[string]*Tenant
@@ -261,6 +262,27 @@ func (r reply) wait() []byte {
 type connState struct {
 	noCache bool
 	tenant  *Tenant
+	// lane pins the connection's requests to one backend connection per
+	// shard, so Redis runs them in the order the client sent them
+	lane uint64
+	// closed when this connection's latest deferred (quota-throttled)
+	// request has been handed to its shard queue; later requests on the
+	// connection are dispatched after it so they reach Redis in order
+	lastDispatch chan struct{}
+}
+
+// dispatched reports whether the connection has no deferred request still
+// waiting to be handed to a shard queue.
+func (st *connState) dispatched() bool {
+	if st.lastDispatch == nil {
+		return true
+	}
+	select {
+	case <-st.lastDispatch:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Proxy) serve(nc net.Conn) {
@@ -287,7 +309,7 @@ func (p *Proxy) serve(nc net.Conn) {
 		}
 		w.Flush()
 	}()
-	st := connState{tenant: p.tenant("")}
+	st := connState{tenant: p.tenant(""), lane: p.laneSeq.Add(1)}
 	for {
 		args, err := r.ReadCommand()
 		if err != nil || len(args) == 0 {
@@ -454,15 +476,39 @@ func (p *Proxy) forward(st *connState, shard int, enc []byte, cmd string) reply 
 			t.Refused.Add(1)
 			return reply{raw: resp.AppendError(nil, "ERR tenant over RU quota")}
 		}
-		if wait > 0 {
-			t.Throttled.Add(1)
-			time.Sleep(wait)
+		if wait > 0 || !st.dispatched() {
+			// Dispatch later without blocking this connection's reader. It
+			// used to sleep here, so the reader stopped reading, the tenant's
+			// debt never exceeded one request, nothing was ever refused, and
+			// the backlog grew in the socket instead (README E5: 0 refused,
+			// p99 89 s). Now the reader keeps reserving, the debt grows, and
+			// requests that would wait past MaxQuotaWait are refused at once.
+			// Dispatch times increase with the debt, so the connection's
+			// commands still reach Redis in order; replies are written in
+			// order by the connection's writer.
+			if wait > 0 {
+				t.Throttled.Add(1)
+			}
+			later := make(chan backend.Result, 1)
+			q := p.fq[shard]
+			prev, done, lane := st.lastDispatch, make(chan struct{}), st.lane
+			st.lastDispatch = done
+			time.AfterFunc(wait, func() {
+				if prev != nil {
+					<-prev
+				}
+				c := q.enqueue(t, cost, enc, t.cfg.Weight, lane)
+				close(done)
+				later <- <-c
+			})
+			ch = later
+		} else {
+			ch = p.fq[shard].enqueue(t, cost, enc, t.cfg.Weight, st.lane)
 		}
-		ch = p.fq[shard].enqueue(t, cost, enc, t.cfg.Weight)
 	} else if p.cfg.Isolation {
-		ch = p.fq[shard].submit(t, t.estimate(cmd, len(enc)), enc)
+		ch = p.fq[shard].submit(t, t.estimate(cmd, len(enc)), enc, st.lane)
 	} else {
-		ch = p.servers[shard].Go(enc)
+		ch = p.servers[shard].GoLane(st.lane, enc)
 	}
 	return reply{ch: ch, acct: t, cmd: cmd, write: write, reqLen: len(enc)}
 }

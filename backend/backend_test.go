@@ -25,6 +25,7 @@ type echoServer struct {
 	dropAfter int64
 	mu        sync.Mutex
 	first     []string // first command seen on each connection
+	seen      []string // every command, in the order the server read them
 	// a command named HANG gets no reply, and nothing after it on that
 	// connection is answered (a stopped or wedged server)
 }
@@ -64,11 +65,12 @@ func (e *echoServer) serve(c net.Conn) {
 		for _, a := range args {
 			parts = append(parts, string(a))
 		}
+		e.mu.Lock()
 		if n == 0 {
-			e.mu.Lock()
 			e.first = append(e.first, strings.Join(parts, " "))
-			e.mu.Unlock()
 		}
+		e.seen = append(e.seen, strings.Join(parts, " "))
+		e.mu.Unlock()
 		n++
 		e.cmds.Add(1)
 		if parts[0] == "HANG" {
@@ -208,6 +210,9 @@ func TestCloseFailsCallsAndStopsReconnecting(t *testing.T) {
 	if _, err := s.Do(cmd("PING")); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; e.conns.Load() < 2 && i < 200; i++ { // both connections dialed
+		time.Sleep(5 * time.Millisecond)
+	}
 	s.Close()
 	s.Close() // idempotent
 	if _, err := s.Do(cmd("PING")); !errors.Is(err, ErrServerClosed) {
@@ -278,5 +283,36 @@ func TestNoReadTimeoutByDefault(t *testing.T) {
 	case r := <-ch:
 		t.Fatalf("returned %v without a timeout configured", r)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Calls with the same lane share a connection, so the server reads them in
+// call order.
+func TestGoLaneKeepsOrder(t *testing.T) {
+	e := startEcho(t, 0)
+	s := NewServer(e.ln.Addr().String(), 4)
+	defer s.Close()
+	var chans []<-chan Result
+	for i := 0; i < 500; i++ {
+		chans = append(chans, s.GoLane(7, cmd("ECHO", fmt.Sprint(i))))
+	}
+	for i, ch := range chans {
+		r := <-ch
+		if r.Err != nil || string(r.Reply.Str) != fmt.Sprint("ECHO ", i) {
+			t.Fatalf("call %d: %q %v", i, r.Reply.Str, r.Err)
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	next := 0
+	for _, c := range e.seen {
+		if c == fmt.Sprint("ECHO ", next) {
+			next++
+		} else if strings.HasPrefix(c, "ECHO ") {
+			t.Fatalf("server read %q while expecting ECHO %d", c, next)
+		}
+	}
+	if next != 500 {
+		t.Fatalf("server read %d of 500 in order", next)
 	}
 }
