@@ -171,3 +171,58 @@ too (see round 1).
 
 `backend/backend.go`, `backend/backend_test.go`, `proxy/proxy.go`, `proxy/proxy_test.go`, `cmd/hkproxy/main.go`,
 `README.md`, `IMPROVEMENTS.md`.
+
+## Round 3 (2026-11-05): the lost-write check can no longer pass without checking; hkload measurement code tested
+
+Stacked on round 2 (`improve/round-2`).
+
+### What changed
+
+1. **Bug: the "no lost writes" check could silently not run.** After each run `hkload` reads the five hottest
+   rooms' like counters and leaderboards back from Redis and reports `lost_increments` and `lost_gift_score`
+   (the README's "0 lost increments"). If either read failed, the room was skipped without a word, so a run
+   whose check could not read anything reported **0 lost**. A failed or unexpected read now stops the run. Reading
+   the replies moved into `counter` and `scoreSum`, which treat a missing key as 0 and an error reply (for
+   example `MOVED`) as an error.
+2. **Measurement parsers extracted and tested.** Shard load comes from `INFO commandstats` and proxy/Redis CPU
+   from `/proc/<pid>/stat`; both were parsed inline. `parseCommandstats` (sums `calls=`, leaves out INFO and
+   CLUSTER, accepts `\r\n` or `\n`) and `statCPUSeconds` (counts fields after the last `)`, so a command name with
+   spaces or parentheses such as `redis-server *:7001)` cannot shift them; errors instead of silently reading 0)
+   are tested, as are the Zipf sampler (each skew's room shares within 5 standard errors of the exact
+   probabilities over 200,000 draws) and the latency percentiles. A failed `INFO` or `/proc` read is now logged
+   instead of silently counted as 0.
+
+### How it was verified
+
+```
+$ go test -count=1 -v ./... | grep -E '^--- ' | awk '{print $2}' | sort | uniq -c    # round 2 -> this round
+     31 PASS: -> 36 PASS:
+$ go test -race -count=1 ./... ; golangci-lint run ./...    # all ok; 0 issues
+```
+
+`cmd/hkload` coverage 0% -> 13.6% (the rest is the load loop against a live cluster).
+
+E1 at s = 2.0, hot-key proxy, 3 repetitions, same script as rounds 1 and 2, with this round's `hkload`, and `main`
+re-run right after it:
+
+| | main (round 1 time) | round 2 | this round | main, re-run now |
+|---|---|---|---|---|
+| calls on the hottest shard (median) | 40,752 | 40,756 | 40,752 | 40,751 |
+| shard calls, rep 1 | 40,752 / 16,754 / 30,491 | 40,751 / 16,756 / 30,501 | 40,753 / 16,757 / 30,495 | |
+| max / mean, hit ratio | 1.39, 0.86 | 1.39, 0.86 | 1.39, 0.86 | |
+| lost writes, errors | 0, 0 | 0, 0 | 0, 0 | 0, 0 |
+| req per proxy CPU-s | 13,063 / 12,853 / 13,029 | 13,236 / 13,004 / 12,723 | 17,331 / 16,906 / 17,316 | 17,391 / 17,513 / 17,197 |
+
+The shard counts and the lost-write result (now checked strictly) are unchanged. Requests per proxy CPU-second
+jumped for both this branch and main between the earlier runs and now, so it reflects the VM's state at the time,
+not the code: this round only changes the load generator, and main measured at the same time agrees.
+
+### Claims I could not verify (update)
+
+Round 1 listed the README's 18,639 requests per proxy CPU-second as not reproduced (13,029 on main then). Re-run now
+on the same VM, main gives 17,391 / 17,513 / 17,197: the figure depends on the machine's state, and the README's
+value is within about 7% of the current one. Left unchanged.
+
+### Files touched
+
+`cmd/hkload/main.go`, `cmd/hkload/hkload_test.go` (new), `IMPROVEMENTS.md`.

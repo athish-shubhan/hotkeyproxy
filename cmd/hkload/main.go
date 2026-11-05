@@ -368,21 +368,21 @@ func main() {
 	// No lost writes: the hottest rooms' counters and leaderboards must add up.
 	for room := 0; room < 5 && room < *rooms; room++ {
 		rs := strconv.Itoa(room)
+		// A check that cannot read the counters must not report "0 lost": the
+		// run stops instead (a failed read used to be skipped silently).
 		v, err := shards[m.Shard([]byte("room:"+rs+":likes"))].Do(resp.AppendCommand(nil, []byte("GET"), []byte("room:"+rs+":likes")))
-		if err == nil {
-			got, _ := strconv.ParseInt(string(v.Str), 10, 64)
-			res.LostIncrements += likes[room].Load() - got
+		got, err := counter(v, err)
+		if err != nil {
+			log.Fatalf("lost-write check, room %s likes: %v", rs, err)
 		}
+		res.LostIncrements += likes[room].Load() - got
 		k := []byte("room:" + rs + ":lb")
 		v, err = shards[m.Shard(k)].Do(resp.AppendCommand(nil, []byte("ZRANGE"), k, []byte("0"), []byte("-1"), []byte("WITHSCORES")))
-		if err == nil {
-			var s float64
-			for i := 1; i < len(v.Elems); i += 2 {
-				f, _ := strconv.ParseFloat(string(v.Elems[i].Str), 64)
-				s += f
-			}
-			res.LostGiftScore += float64(gifts[room].Load()) - s
+		total, err := scoreSum(v, err)
+		if err != nil {
+			log.Fatalf("lost-write check, room %s leaderboard: %v", rs, err)
 		}
+		res.LostGiftScore += float64(gifts[room].Load()) - total
 	}
 	res.Label = *label
 	statsAfter := fetchStats(*statsURLs)
@@ -453,23 +453,70 @@ func commandstats(shards []*backend.Server) []int64 {
 	for i, s := range shards {
 		rep, err := s.Do(resp.AppendCommand(nil, []byte("INFO"), []byte("commandstats")))
 		if err != nil {
+			log.Printf("INFO commandstats on %s: %v (counted as 0)", s.Addr, err)
 			continue
 		}
-		for _, line := range strings.Split(string(rep.Str), "\r\n") {
-			if !strings.HasPrefix(line, "cmdstat_") || strings.HasPrefix(line, "cmdstat_info") || strings.HasPrefix(line, "cmdstat_cluster") {
-				continue
-			}
-			if j := strings.Index(line, "calls="); j >= 0 {
-				v := line[j+6:]
-				if k := strings.IndexByte(v, ','); k >= 0 {
-					v = v[:k]
-				}
-				n, _ := strconv.ParseInt(v, 10, 64)
-				out[i] += n
-			}
-		}
+		out[i] = parseCommandstats(string(rep.Str))
 	}
 	return out
+}
+
+// parseCommandstats sums calls= over an INFO commandstats reply, leaving out
+// INFO and CLUSTER (the harness's own polling, not workload).
+func parseCommandstats(info string) int64 {
+	var total int64
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "cmdstat_") || strings.HasPrefix(line, "cmdstat_info:") || strings.HasPrefix(line, "cmdstat_cluster") {
+			continue
+		}
+		if j := strings.Index(line, "calls="); j >= 0 {
+			v := line[j+6:]
+			if k := strings.IndexByte(v, ','); k >= 0 {
+				v = v[:k]
+			}
+			n, _ := strconv.ParseInt(v, 10, 64)
+			total += n
+		}
+	}
+	return total
+}
+
+// counter reads an integer counter reply (GET of an INCRBY key); a missing
+// key is 0.
+func counter(v resp.Reply, err error) (int64, error) {
+	if err != nil {
+		return 0, err
+	}
+	switch v.Type {
+	case '$':
+		if v.Str == nil {
+			return 0, nil
+		}
+		return strconv.ParseInt(string(v.Str), 10, 64)
+	case ':':
+		return v.Int, nil
+	}
+	return 0, fmt.Errorf("unexpected reply %q", v.Raw)
+}
+
+// scoreSum adds the scores of a ZRANGE ... WITHSCORES reply.
+func scoreSum(v resp.Reply, err error) (float64, error) {
+	if err != nil {
+		return 0, err
+	}
+	if v.Type != '*' || len(v.Elems)%2 != 0 {
+		return 0, fmt.Errorf("unexpected reply %q", v.Raw)
+	}
+	var s float64
+	for i := 1; i < len(v.Elems); i += 2 {
+		f, err := strconv.ParseFloat(string(v.Elems[i].Str), 64)
+		if err != nil {
+			return 0, err
+		}
+		s += f
+	}
+	return s, nil
 }
 
 // cpuOf sums user+system CPU seconds of the given PIDs from /proc.
@@ -481,13 +528,35 @@ func cpuOf(pids string) float64 {
 		}
 		b, err := os.ReadFile("/proc/" + p + "/stat")
 		if err != nil {
+			log.Printf("cpu of pid %s: %v (counted as 0)", p, err)
 			continue
 		}
-		s := string(b)
-		f := strings.Fields(s[strings.LastIndexByte(s, ')')+2:])
-		u, _ := strconv.ParseFloat(f[11], 64)
-		k, _ := strconv.ParseFloat(f[12], 64)
-		t += (u + k) / 100 // clock ticks, 100 Hz on Linux
+		sec, err := statCPUSeconds(string(b))
+		if err != nil {
+			log.Printf("cpu of pid %s: %v (counted as 0)", p, err)
+			continue
+		}
+		t += sec
 	}
 	return t
+}
+
+// statCPUSeconds reads utime + stime from a /proc/<pid>/stat line, in
+// seconds at 100 clock ticks per second (Linux's USER_HZ). The command name
+// may contain spaces and parentheses, so fields are counted after the last ')'.
+func statCPUSeconds(stat string) (float64, error) {
+	i := strings.LastIndexByte(stat, ')')
+	if i < 0 || i+2 > len(stat) {
+		return 0, fmt.Errorf("malformed stat line")
+	}
+	f := strings.Fields(stat[i+2:])
+	if len(f) < 13 {
+		return 0, fmt.Errorf("stat line has %d fields after the name", len(f))
+	}
+	u, err1 := strconv.ParseFloat(f[11], 64)
+	k, err2 := strconv.ParseFloat(f[12], 64)
+	if err1 != nil || err2 != nil {
+		return 0, fmt.Errorf("bad utime/stime %q %q", f[11], f[12])
+	}
+	return (u + k) / 100, nil
 }
