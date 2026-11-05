@@ -94,9 +94,14 @@ func fetchStats(urls string) []proxy.StatsJSON {
 			continue
 		}
 		var s proxy.StatsJSON
-		if r, err := http.Get(u); err == nil {
-			json.NewDecoder(r.Body).Decode(&s)
-			r.Body.Close()
+		r, err := http.Get(u)
+		if err == nil {
+			err = json.NewDecoder(r.Body).Decode(&s)
+			_ = r.Body.Close()
+		}
+		if err != nil {
+			// the run is still recorded, but say that its proxy stats are zeros
+			log.Printf("proxy stats from %s: %v (recorded as zeros)", u, err)
 		}
 		out = append(out, s)
 	}
@@ -179,7 +184,9 @@ func main() {
 
 	if *flush {
 		for _, sh := range shards {
-			sh.Do(resp.AppendCommand(nil, []byte("FLUSHALL")))
+			if rep, err := sh.Do(resp.AppendCommand(nil, []byte("FLUSHALL"))); err != nil || rep.Type == '-' {
+				log.Fatalf("FLUSHALL on %s: %v %s", sh.Addr, err, rep.Raw)
+			}
 		}
 	}
 	if *preload > 0 {
@@ -189,7 +196,10 @@ func main() {
 			for u := 0; u < *preload; u++ {
 				args = append(args, []byte(strconv.Itoa(u*7%1000)), []byte("user:"+strconv.Itoa(u)))
 			}
-			shards[m.Shard(k)].Do(resp.AppendCommand(nil, args...))
+			// a failed preload would run the leaderboard reads on empty keys
+			if rep, err := shards[m.Shard(k)].Do(resp.AppendCommand(nil, args...)); err != nil || rep.Type == '-' {
+				log.Fatalf("preload %s: %v %s", k, err, rep.Raw)
+			}
 		}
 	}
 	// open-loop schedule, optionally with a burst at burstX times the rate
@@ -249,9 +259,10 @@ func main() {
 				room := z.sample(r)
 				if *shift > 0 && time.Since(start) >= *shift {
 					// a cold room goes viral: swap it with rank 0
-					if room == 0 {
+					switch room {
+					case 0:
 						room = *rooms / 2
-					} else if room == *rooms/2 {
+					case *rooms / 2:
 						room = 0
 					}
 				}
@@ -413,10 +424,16 @@ func main() {
 	b, _ := json.Marshal(res)
 	fmt.Println(string(b))
 	if *out != "" {
+		// a run whose result cannot be recorded must not look like it succeeded
 		f, err := os.OpenFile(*out, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err == nil {
-			f.Write(append(b, '\n'))
-			f.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			log.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			log.Fatal(err)
 		}
 	}
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"sort"
 	"strconv"
@@ -25,6 +26,10 @@ type fakeRedis struct {
 	zsets map[string]map[string]float64
 	calls atomic.Int64
 	incrs atomic.Int64
+	// gate, when set, holds every command until it is closed; arrivals
+	// records GET keys in the order the backend received them.
+	gate     chan struct{}
+	arrivals []string
 }
 
 func startFake(t *testing.T) *fakeRedis {
@@ -58,7 +63,13 @@ func (f *fakeRedis) serve(c net.Conn) {
 		}
 		f.calls.Add(1)
 		cmd := strings.ToUpper(string(args[0]))
+		if f.gate != nil && cmd != "CLUSTER" {
+			<-f.gate
+		}
 		f.mu.Lock()
+		if cmd == "GET" {
+			f.arrivals = append(f.arrivals, string(args[1]))
+		}
 		var out []byte
 		switch cmd {
 		case "CLUSTER":
@@ -233,7 +244,12 @@ func TestCrossSlotRejected(t *testing.T) {
 }
 
 // With one request in flight per shard, a victim's request submitted behind
-// a noisy tenant's queue of heavy requests is dispatched almost at once.
+// a noisy tenant's queue of heavy requests is the next one dispatched.
+//
+// The backend is held until everything is queued, and the order is read from
+// what the backend received. The old version raced the backend against the
+// submit loop and read completion order from goroutines, and failed about 1
+// run in 6 under -race.
 func TestFairQueueServesVictimFirst(t *testing.T) {
 	f := startFake(t)
 	p := newProxy(t, f, func(c *Config) {
@@ -241,35 +257,29 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 		c.Isolation = true
 		c.MaxInFlight = 1
 	})
+	f.gate = make(chan struct{})
 	noisy, victim := p.tenant("noisy"), p.tenant("victim")
 	q := p.fq[0]
-	enc := resp.AppendCommand(nil, []byte("GET"), []byte("k"))
-	var mu sync.Mutex
-	var order []string
-	var wg sync.WaitGroup
-	wait := func(name string, ch <-chan backend.Result) {
-		defer wg.Done()
-		<-ch
-		mu.Lock()
-		order = append(order, name)
-		mu.Unlock()
-	}
+	var chans []<-chan backend.Result
 	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go wait("noisy", q.submit(noisy, 8, enc)) // heavy: 8 RU each
+		chans = append(chans, q.submit(noisy, 8, resp.AppendCommand(nil, []byte("GET"), []byte(fmt.Sprint("n", i))))) // heavy: 8 RU each
 	}
-	wg.Add(1)
-	go wait("victim", q.submit(victim, 1, enc))
-	wg.Wait()
-	for i, n := range order {
-		if n == "victim" {
-			if i > 10 {
-				t.Fatalf("victim completed %dth of %d", i+1, len(order))
-			}
-			return
+	chans = append(chans, q.submit(victim, 1, resp.AppendCommand(nil, []byte("GET"), []byte("victim"))))
+	close(f.gate)
+	for _, ch := range chans {
+		if r := <-ch; r.Err != nil {
+			t.Fatal(r.Err)
 		}
 	}
-	t.Fatal("victim never completed")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.arrivals) != 201 {
+		t.Fatalf("backend saw %d GETs, want 201", len(f.arrivals))
+	}
+	// arrivals[0] is the noisy request already in flight when the rest queued
+	if f.arrivals[0] != "n0" || f.arrivals[1] != "victim" {
+		t.Fatalf("dispatch order starts %v, want [n0 victim ...]", f.arrivals[:5])
+	}
 }
 
 func TestRUCharging(t *testing.T) {
