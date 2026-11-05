@@ -226,3 +226,78 @@ value is within about 7% of the current one. Left unchanged.
 ### Files touched
 
 `cmd/hkload/main.go`, `cmd/hkload/hkload_test.go` (new), `IMPROVEMENTS.md`.
+
+## Round 4 (2026-11-05): pipelined commands kept in order; the enforced quota refuses instead of queueing
+
+Stacked on round 3 (`improve/round-3`).
+
+### What changed
+
+1. **Bug: one client's pipelined commands ran on Redis in any order.** The proxy sent each command to the next
+   of the shard's pipelined backend connections (round robin), and each connection is written independently, so
+   `SET k v` followed by `GET k` on the same client connection could run in either order. Against a real Redis
+   node, on main, a GET pipelined right after its own SET returned a different value in **4,958 to 4,973 of 5,000**
+   pairs (three runs). Each client connection now gets a lane, and its forwarded commands use one backend
+   connection per shard (`backend.Server.GoLane`), so they run in the order sent. The fair queue also handed
+   items to the backend after releasing its lock, so two completions could race and reverse a tenant's requests
+   (374 of 5,000 wrong with isolation on, after the first fix); it now hands over under the lock (a send on a
+   buffered channel; the backend never takes that lock). The hot-key cache and the write combiner are
+   unchanged: they are bounded-staleness by design (`CLIENT CACHING no` opts out of the cache).
+2. **Bug (documented in the README as not fixed): the enforced quota never refused.** With `-quota-shape`, a
+   request over quota slept on its connection's reader goroutine until its tokens were earned. While it slept
+   nothing more was read, so the tenant's debt never exceeded one request, the 200 ms refusal limit was never
+   reached (README E5: 0 refused) and the backlog grew in the socket (p99 89 s). Throttled requests are now
+   dispatched by a timer while the reader keeps going; the debt grows with what the client sends, and a request
+   that would wait past `-max-quota-wait` is refused at once. Deferred dispatches on one connection are chained,
+   so they still reach Redis in order.
+
+### How it was verified
+
+Tests: `TestPipelinedCommandsKeepOrder` (real Redis, 5,000 SET/GET pairs, with and without isolation; on main the
+same check gave 4,958-4,973 wrong), `TestQuotaRefusesInsteadOfQueueing` (300 pipelined GETs at a 100 RU/s quota:
+120 admitted, 180 refused, done in 0.22 s, admitted ones reach Redis in order; on round 3: `ok 300 refused 0`,
+2.0 s), `TestGoLaneKeepsOrder`. Round 1's `TestCloseFailsCallsAndStopsReconnecting` could race with the second
+connection's dial; it now waits for both connections.
+
+E5, enforced-quota ("shape") arm, commands from `bench/run_all.sh`:
+
+| | noisy p50 / p99 | noisy refused | admitted RU (30 s) | victim burst-window p99 |
+|---|---|---|---|---|
+| round 3, `hkload` default 256 workers (3 reps) | 89.0-89.1 s p99 | 0 | 72,000 | 1.6-2.2 ms |
+| round 4, 256 workers (3 reps) | 23.8 s p99 | 21,482-21,546 | | 2.0-2.6 ms |
+| round 3, noisy client `-workers 4096` (2 reps) | 44.0 s / 89.0-89.1 s | 0 | 72,000 | 2.9-3.4 ms |
+| round 4, noisy client `-workers 4096` (2 reps) | **283 ms / 434-450 ms** | 26,643 | 18,714 (about 624 RU/s, quota 600) | 2.6-3.2 ms |
+
+With the default 256 workers the remaining 23.8 s is the load generator's own backlog: it measures from each
+request's scheduled time, and 256 workers each waiting up to 200 ms cannot keep up with a 3,000 req/s burst. With
+enough client concurrency the proxy answers within about 0.45 s at p99; that is above the 200 ms limit because
+replies on one connection are returned in order, so a refusal waits behind an admitted request ahead of it.
+
+E1 at s = 2.0 (connection affinity touches the forwarding path), round 4 then main, 6 repetitions each:
+
+```
+round 4  req per proxy CPU-s [13822, 14545, 15302, 15528, 15060, 15072]  median 15,066
+main     req per proxy CPU-s [15468, 14970, 14993, 15385, 15528, 16300]  median 15,427
+hottest shard 40,754 vs 40,748; max/mean 1.39; hit 0.86; p50 0.25 ms; p99 1.59 vs 1.60 ms; 0 lost, 0 errors
+```
+
+Affinity costs at most about 2-3% of proxy CPU efficiency here (the ranges overlap); shard load and latency are
+unchanged.
+
+```
+$ go test -count=1 -v ./... | grep -E '^--- ' | awk '{print $2}' | sort | uniq -c    # round 3 -> this round
+     36 PASS: -> 39 PASS:
+$ go test -race -count=2 ./... ; golangci-lint run ./...    # all ok; 0 issues
+```
+
+The README keeps its original E5 table and gains a dated note with the re-measured shape arm.
+
+### Not verified
+
+E5's off and soft arms and E2-E7 were not re-run. The re-measured E5 numbers come from this VM, not the fresh
+instance the README's E5 table was measured on.
+
+### Files touched
+
+`backend/backend.go`, `backend/backend_test.go`, `proxy/proxy.go`, `proxy/tenant.go`, `proxy/proxy_test.go`,
+`proxy/redis_test.go`, `README.md`, `IMPROVEMENTS.md`.

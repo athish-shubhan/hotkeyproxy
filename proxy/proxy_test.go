@@ -268,9 +268,9 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 	q := p.fq[0]
 	var chans []<-chan backend.Result
 	for i := 0; i < 200; i++ {
-		chans = append(chans, q.submit(noisy, 8, resp.AppendCommand(nil, []byte("GET"), []byte(fmt.Sprint("n", i))))) // heavy: 8 RU each
+		chans = append(chans, q.submit(noisy, 8, resp.AppendCommand(nil, []byte("GET"), []byte(fmt.Sprint("n", i))), 1)) // heavy: 8 RU each
 	}
-	chans = append(chans, q.submit(victim, 1, resp.AppendCommand(nil, []byte("GET"), []byte("victim"))))
+	chans = append(chans, q.submit(victim, 1, resp.AppendCommand(nil, []byte("GET"), []byte("victim")), 2))
 	close(gate)
 	for _, ch := range chans {
 		if r := <-ch; r.Err != nil {
@@ -356,4 +356,72 @@ func TestBackendTimeoutBecomesErrorReply(t *testing.T) {
 	if !ok {
 		t.Fatal("requests did not recover after the shard answered again")
 	}
+}
+
+// A client sending faster than its quota on one pipelined connection gets
+// refusals within MaxQuotaWait, not an unbounded queue: 300 one-RU GETs at a
+// 100 RU/s quota used to be all admitted, one per 10 ms, the last one about
+// 2 s late, and none refused.
+func TestQuotaRefusesInsteadOfQueueing(t *testing.T) {
+	f := startFake(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	p := newProxy(t, f, func(c *Config) {
+		c.Hot = false
+		c.Isolation = true
+		c.QuotaShape = true
+		c.MaxQuotaWait = 200 * time.Millisecond
+		c.Tenants = []TenantConfig{{Name: "noisy", QuotaRU: 100, Weight: 1}}
+		c.Listen = listen
+		c.StatsAddr = ""
+	})
+	go func() { _ = p.ListenAndServe() }()
+	c := dial(t, listen)
+	if r := c.do("AUTH", "noisy"); string(r.Raw) != "+OK\r\n" {
+		t.Fatalf("AUTH: %q", r.Raw)
+	}
+	const n = 300
+	var batch []byte
+	for i := 0; i < n; i++ {
+		batch = resp.AppendCommand(batch, []byte("GET"), []byte(fmt.Sprintf("k%03d", i)))
+	}
+	start := time.Now()
+	if _, err := c.c.Write(batch); err != nil {
+		t.Fatal(err)
+	}
+	ok, refused := 0, 0
+	for i := 0; i < n; i++ {
+		rep, err := c.r.ReadReply()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case rep.Type == '-' && strings.Contains(string(rep.Raw), "over RU quota"):
+			refused++
+		case rep.Type == '$':
+			ok++
+		default:
+			t.Fatalf("reply %d: %q", i, rep.Raw)
+		}
+	}
+	took := time.Since(start)
+	// the bucket starts full (100 RU) and refills 100 RU/s; with a 200 ms
+	// limit about 120 requests fit, the rest are refused at once
+	if refused == 0 || ok < 100 || ok > 160 {
+		t.Fatalf("ok %d refused %d", ok, refused)
+	}
+	if took > time.Second {
+		t.Fatalf("took %v: requests queued past MaxQuotaWait", took)
+	}
+	// admitted commands reached Redis in the order they were sent
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := 1; i < len(f.arrivals); i++ {
+		if f.arrivals[i] < f.arrivals[i-1] {
+			t.Fatalf("out of order at %d: %s after %s", i, f.arrivals[i], f.arrivals[i-1])
+		}
+	}
+	if len(f.arrivals) != ok {
+		t.Fatalf("backend saw %d GETs, %d admitted", len(f.arrivals), ok)
+	}
+	t.Logf("%d admitted, %d refused, %v", ok, refused, took)
 }

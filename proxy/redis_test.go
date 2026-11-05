@@ -176,3 +176,47 @@ func TestAgainstRealRedis(t *testing.T) {
 		t.Fatalf("MULTI must be refused: %q", r.Raw)
 	}
 }
+
+// A GET pipelined after a SET on the same connection must see that SET. The
+// proxy used to spread one client's commands over the shard's pipelined
+// connections round robin, so Redis ran them in any order: on main this test
+// saw a different value in about 4,960 of 5,000 pairs.
+func TestPipelinedCommandsKeepOrder(t *testing.T) {
+	seed := startRedisCluster(t)
+	for _, iso := range []bool{false, true} {
+		cfg := DefaultConfig()
+		cfg.Seed, cfg.StatsAddr, cfg.Hot, cfg.Isolation = seed, "", false, iso
+		cfg.Listen = fmt.Sprintf("127.0.0.1:%d", freePort(t))
+		p, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _ = p.ListenAndServe() }()
+		c := dial(t, cfg.Listen)
+		var b []byte
+		const n = 5000
+		for i := 1; i <= n; i++ {
+			b = resp.AppendCommand(b, []byte("SET"), []byte("order:k"), []byte(strconv.Itoa(i)))
+			b = resp.AppendCommand(b, []byte("GET"), []byte("order:k"))
+		}
+		if _, err := c.c.Write(b); err != nil {
+			t.Fatal(err)
+		}
+		wrong := 0
+		for i := 1; i <= n; i++ {
+			if _, err := c.r.ReadReply(); err != nil {
+				t.Fatal(err)
+			}
+			r, err := c.r.ReadReply()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(r.Str) != strconv.Itoa(i) {
+				wrong++
+			}
+		}
+		if wrong > 0 {
+			t.Fatalf("isolation=%v: %d of %d GETs did not see the SET just before them", iso, wrong, n)
+		}
+	}
+}
