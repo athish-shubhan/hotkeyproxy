@@ -143,6 +143,7 @@ type fqItem struct {
 	seq           uint64
 	enc           []byte
 	out           chan backend.Result
+	tenant        *Tenant
 }
 
 type fqHeap []*fqItem
@@ -173,6 +174,9 @@ type wfq struct {
 	seq      uint64
 	h        fqHeap
 	Queued   atomic.Int64
+
+	// onDispatch, when set (tests), is called as each request is sent to the shard.
+	onDispatch func(t *Tenant)
 }
 
 func newWFQ(srv *backend.Server, shard, max int) *wfq { return &wfq{srv: srv, shard: shard, max: max} }
@@ -194,7 +198,7 @@ func (q *wfq) enqueue(t *Tenant, cost float64, enc []byte, w float64) <-chan bac
 	out := make(chan backend.Result, 1)
 	q.mu.Lock()
 	start := math.Max(q.vtime, t.lastFinishAt(q.shard))
-	it := &fqItem{start: start, finish: start + cost/w, enc: enc, out: out}
+	it := &fqItem{start: start, finish: start + cost/w, enc: enc, out: out, tenant: t}
 	t.setLastFinish(q.shard, it.finish)
 	q.seq++
 	it.seq = q.seq
@@ -224,6 +228,9 @@ func (t *Tenant) setLastFinish(shard int, f float64) {
 }
 
 func (q *wfq) dispatch(it *fqItem) {
+	if q.onDispatch != nil {
+		q.onDispatch(it.tenant)
+	}
 	ch := q.srv.Go(it.enc)
 	go func() {
 		r := <-ch

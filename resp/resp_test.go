@@ -2,6 +2,7 @@ package resp
 
 import (
 	"bytes"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -65,4 +66,26 @@ func FuzzReadCommand(f *testing.F) {
 			}
 		}
 	})
+}
+
+func TestHugeBulkHeaderDoesNotPreallocate(t *testing.T) {
+	// claims a 500 MiB bulk but sends 10 bytes, then EOF
+	r := NewReader(strings.NewReader("*1\r\n$524288000\r\n0123456789"))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := r.ReadCommand()
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Fatal("expected an error for a truncated bulk")
+	}
+	if got := after.TotalAlloc - before.TotalAlloc; got > 16<<20 {
+		t.Fatalf("allocated %d bytes for a truncated bulk", got)
+	}
+}
+
+func TestTooManyArgs(t *testing.T) {
+	r := NewReader(strings.NewReader("*99999999\r\n"))
+	if _, err := r.ReadCommand(); err != ErrTooLarge {
+		t.Fatalf("got %v", err)
+	}
 }

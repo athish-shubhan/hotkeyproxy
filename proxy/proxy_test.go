@@ -245,31 +245,38 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 	q := p.fq[0]
 	enc := resp.AppendCommand(nil, []byte("GET"), []byte("k"))
 	var mu sync.Mutex
-	var order []string
-	var wg sync.WaitGroup
-	wait := func(name string, ch <-chan backend.Result) {
-		defer wg.Done()
-		<-ch
+	var order []string // dispatch order to the shard
+	q.onDispatch = func(t *Tenant) {
 		mu.Lock()
-		order = append(order, name)
+		order = append(order, t.Name())
 		mu.Unlock()
 	}
+	var chans []<-chan backend.Result
 	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go wait("noisy", q.submit(noisy, 8, enc)) // heavy: 8 RU each
+		chans = append(chans, q.submit(noisy, 8, enc)) // heavy: 8 RU each
 	}
-	wg.Add(1)
-	go wait("victim", q.submit(victim, 1, enc))
-	wg.Wait()
+	mu.Lock()
+	before := len(order) // noisy requests already sent when the victim arrives
+	mu.Unlock()
+	chans = append(chans, q.submit(victim, 1, enc))
+	for _, ch := range chans {
+		<-ch
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 201 {
+		t.Fatalf("dispatched %d requests", len(order))
+	}
 	for i, n := range order {
 		if n == "victim" {
-			if i > 10 {
-				t.Fatalf("victim completed %dth of %d", i+1, len(order))
+			// at most the request in flight (plus a little scheduling slack) goes first
+			if i > before+2 {
+				t.Fatalf("victim dispatched %dth of %d (%d noisy already sent)", i+1, len(order), before)
 			}
 			return
 		}
 	}
-	t.Fatal("victim never completed")
+	t.Fatal("victim never dispatched")
 }
 
 func TestRUCharging(t *testing.T) {

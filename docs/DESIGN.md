@@ -180,7 +180,7 @@ past the queueing knee. Requests per proxy CPU-second is from `/proc`.
 - The CLIENT TRACKING baseline simulates application servers inside the
   load generator, on the same box as everything else.
 
-## 12. Interview defence notes
+## 12. Design notes
 
 - *Why is a hot key a single-shard problem even with I/O threads?* Redis 6+
   I/O threads parallelise socket reads/writes and parsing, but command

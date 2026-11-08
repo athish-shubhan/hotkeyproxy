@@ -32,11 +32,17 @@ func main() {
 	flag.Parse()
 	for _, t := range strings.Split(*tenants, ",") {
 		f := strings.Split(t, ":")
-		if len(f) != 3 {
+		if t == "" {
 			continue
 		}
-		q, _ := strconv.ParseFloat(f[1], 64)
-		w, _ := strconv.ParseFloat(f[2], 64)
+		if len(f) != 3 {
+			log.Fatalf("bad -tenants entry %q (want tenant:quotaRU:weight)", t)
+		}
+		q, err1 := strconv.ParseFloat(f[1], 64)
+		w, err2 := strconv.ParseFloat(f[2], 64)
+		if err1 != nil || err2 != nil {
+			log.Fatalf("bad -tenants entry %q: quota and weight must be numbers", t)
+		}
 		c.Tenants = append(c.Tenants, proxy.TenantConfig{Name: f[0], QuotaRU: q, Weight: w})
 	}
 	var p *proxy.Proxy

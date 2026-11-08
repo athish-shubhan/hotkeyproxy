@@ -18,6 +18,13 @@ var (
 
 const maxBulk = 512 << 20
 
+// maxArgs bounds the argument count of one command (Redis allows 1M for
+// unauthenticated clients); readChunk is the allocation step for bulk bodies.
+const (
+	maxArgs   = 1 << 20
+	readChunk = 1 << 20
+)
+
 type Reader struct {
 	r    *bufio.Reader
 	args [][]byte
@@ -110,6 +117,9 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 	if err != nil || n < 0 {
 		return nil, ErrProtocol
 	}
+	if n > maxArgs {
+		return nil, ErrTooLarge
+	}
 	r.offs = r.offs[:0]
 	for i := 0; i < n; i++ {
 		h, err := r.line()
@@ -124,9 +134,16 @@ func (r *Reader) ReadCommand() ([][]byte, error) {
 			return nil, ErrProtocol
 		}
 		start := len(r.buf)
-		r.buf = grow(r.buf, sz+2)
-		if _, err := io.ReadFull(r.r, r.buf[start:start+sz+2]); err != nil {
-			return nil, err
+		// Read in chunks so a header claiming a huge bulk cannot make us
+		// allocate it before the peer has sent that many bytes.
+		for left := sz + 2; left > 0; {
+			c := min(left, readChunk)
+			cur := len(r.buf)
+			r.buf = grow(r.buf, c)
+			if _, err := io.ReadFull(r.r, r.buf[cur:cur+c]); err != nil {
+				return nil, err
+			}
+			left -= c
 		}
 		r.buf = r.buf[:start+sz]
 		r.offs = append(r.offs, [2]int{start, start + sz})

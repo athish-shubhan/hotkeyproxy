@@ -2,7 +2,7 @@
 
 A Redis Cluster proxy in Go that reproduces the proxy-side hot-key handling ByteDance describes for ABase (SIGMOD '25): detect hot keys with a decaying Space-Saving sketch, serve hot reads from an actively refreshed cache with a staleness bound, optionally combine hot counter writes, route keys to limited proxy groups, and isolate tenants with request-unit quotas and per-shard fair queueing. Measured on a live-room workload (viewer counts, likes, gift leaderboards) with Zipf-skewed rooms, against direct cluster access, a plain proxy and Redis client-side caching.
 
-## Results (measured on one 2-vCPU VM; median of 3 runs)
+## Results (measured on one 2-vCPU VM; median of 3 runs, no confidence intervals)
 
 Full tables: [`results/SUMMARY.md`](results/SUMMARY.md). Design: [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -68,24 +68,16 @@ bench/     cluster.sh (3-shard Redis Cluster), run_all.sh, plot.py
 
 ```
 # needs redis-server 7 and redis-cli
-bench/run_all.sh          # about 30 minutes: writes results/runs.jsonl, SUMMARY.md, the figure
+bench/run_all.sh          # about 30 minutes: overwrites results/runs.jsonl, SUMMARY.md, the figure
 bench/run_all.sh e5       # tenant isolation only
 go test -race ./...
 ```
+
+The per-experiment numbers above come from `results/runs.jsonl` and `results/SUMMARY.md`.
 
 ## Honest scope
 
 - One 2-vCPU VM runs 3 Redis shards, the proxies and the load generator, so absolute latency and throughput are box-limited and noisy (p99 ranges are in the tables; one 117 ms p99 outlier run was outvoted by a third repetition). Shard-load ratios, hit ratios and lost-write counts do not depend on that. E5 was re-run on a fresh instance of the same VM type after the other experiments; its three arms ran together.
 - Reproduces ABase's proxy mechanisms (hot-key detection, active-update cache, limited fan-out, request units with fair queueing) from the paper's description, not its code, and in simplified form: one proxy, RU costs estimated from moving averages, no quota coordination across proxies.
+- No security: the AUTH password is not checked (a connection chooses its own tenant, so tenant isolation assumes cooperating clients), there is no TLS, and the proxy and stats endpoints default to 127.0.0.1. Do not expose them to untrusted networks.
 - RESP2 only; `MULTI/EXEC`, blocking commands and pub/sub are refused. No Envoy Redis proxy baseline. The CLIENT TRACKING application servers are simulated inside the load generator.
-
-## Resume bullets (numbers from `results/`)
-
-- Built HotKeyProxy, a Go Redis Cluster proxy reproducing ByteDance ABase's hot-key handling: decaying Space-Saving detection, an actively refreshed read cache with a 50 ms staleness bound and fill leases, opt-in write combining, limited fan-out proxy groups, and request-unit tenant quotas with per-shard fair queueing.
-- On a Zipf-skewed live-room workload it cut calls on the hottest shard by 64% (max/mean shard load 1.72 to 1.39) with no lost increments, detected a newly viral room in about 175 ms, and held p99 at 99.5 ms at 40k req/s on one proxy core where a plain proxy reached 874 ms.
-- Benchmarked against Redis client-side caching (CLIENT TRACKING): tracking left the hottest shard 26% fewer calls than the proxy at moderate skew (s = 1.2), the proxy 7% fewer than tracking at s = 2.0; and measured that write combining trades latency for shard load through head-of-line blocking (500 us window: 26% fewer hot-shard calls, p50 0.33 to 1.03 ms), so it ships off by default.
-- Added request-unit tenant quotas with per-shard weighted fair queueing and found that fair queueing with soft quotas did not isolate (victim burst p99 3.9 vs 4.6 ms with none) while enforced quotas did (1.8 ms, against 1.4 ms without the burst), and that the enforced version needs queue-age-based refusal: without it the throttled tenant's backlog reached an 89 s p99.
-
-## Interview defence
-
-See `docs/DESIGN.md` section 12: why a hot key stays a single-shard problem with Redis I/O threads, Count-Min vs Space-Saving, what breaks with write combining, coordinated omission, and why fair queueing alone did not isolate tenants here.

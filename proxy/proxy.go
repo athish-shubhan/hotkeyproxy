@@ -157,7 +157,12 @@ func (p *Proxy) ListenAndServe() error {
 		mux.HandleFunc("/", p.statsHandler)
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		go http.ListenAndServe(p.cfg.StatsAddr, mux)
+		go func() {
+			srv := &http.Server{Addr: p.cfg.StatsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+			if err := srv.ListenAndServe(); err != nil {
+				log.Printf("stats server: %v", err)
+			}
+		}()
 	}
 	ln, err := net.Listen("tcp", p.cfg.Listen)
 	if err != nil {
