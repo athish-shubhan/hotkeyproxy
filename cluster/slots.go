@@ -4,6 +4,7 @@ package cluster
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"strconv"
 
 	"hotkeyproxy/resp"
@@ -54,7 +55,11 @@ type Map struct {
 
 func (m *Map) Shard(key []byte) int { return m.Owner[Slot(key)] }
 
-// FromClusterSlots builds the map from a CLUSTER SLOTS reply.
+// FromClusterSlots builds the map from a CLUSTER SLOTS reply. Each entry is
+// [start, end, [host, port, ...] (the master), replicas...]. An empty host
+// means the node does not know its own address; Redis clients then use the
+// address they queried, which here is 127.0.0.1 (the local benchmark
+// cluster). A range outside 0..16383 or a slot left uncovered is an error.
 func FromClusterSlots(rep resp.Reply) (*Map, error) {
 	if rep.Type != '*' {
 		return nil, fmt.Errorf("CLUSTER SLOTS: unexpected reply %q", rep.Raw)
@@ -68,22 +73,32 @@ func FromClusterSlots(rep resp.Reply) (*Map, error) {
 		if len(r.Elems) < 3 {
 			continue
 		}
-		lo, hi := int(r.Elems[0].Int), int(r.Elems[1].Int)
+		lo, hi := r.Elems[0].Int, r.Elems[1].Int
+		if lo < 0 || hi >= Slots || lo > hi {
+			// used to index Owner out of range (panic) for a negative start
+			return nil, fmt.Errorf("CLUSTER SLOTS: bad slot range %d-%d", lo, hi)
+		}
 		master := r.Elems[2]
 		if len(master.Elems) < 2 {
 			continue
 		}
-		addr := string(master.Elems[0].Str) + ":" + strconv.FormatInt(master.Elems[1].Int, 10)
-		if string(master.Elems[0].Str) == "" {
-			addr = "127.0.0.1:" + strconv.FormatInt(master.Elems[1].Int, 10)
+		host, port := string(master.Elems[0].Str), master.Elems[1].Int
+		if port <= 0 || port > 65535 {
+			return nil, fmt.Errorf("CLUSTER SLOTS: bad port %d for slots %d-%d", port, lo, hi)
 		}
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		// JoinHostPort brackets IPv6 hosts ("[::1]:7000"); plain
+		// concatenation gave an address net.Dial cannot parse.
+		addr := net.JoinHostPort(host, strconv.FormatInt(port, 10))
 		id, ok := idx[addr]
 		if !ok {
 			id = len(m.Addrs)
 			idx[addr] = id
 			m.Addrs = append(m.Addrs, addr)
 		}
-		for s := lo; s <= hi && s < Slots; s++ {
+		for s := lo; s <= hi; s++ {
 			m.Owner[s] = id
 		}
 	}

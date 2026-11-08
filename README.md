@@ -45,10 +45,12 @@ At s = 1.2 tracking leaves the hottest shard 26% fewer calls than the proxy does
 
 Only an enforced quota protected the victim. With a soft quota (ABase-style: over-quota requests are deprioritised, not stopped) the noisy tenant still got all 1,200 req/s through, and per-shard fair queueing almost never engaged (60 requests queued): the interference is CPU and I/O shared on the box, not queueing at a shard, and reordering cannot fix that. Enforcing the quota held the noisy tenant to its 600 RU/s (303 req/s) and the victim's burst p99 to near its baseline (1.6-1.8 ms in every repetition, against 3.5-5.1 ms for the other two). The cost moved to the noisy tenant, and exposed a design gap: its open-loop client kept sending 3,000 req/s, each connection waited for tokens one request at a time so the 200 ms refusal limit never triggered (0 refused), and the backlog queued on its connections until p99 reached 89 s. Refusal has to be based on how long a request has been queued on the connection, not on the token debt at the moment it is read. This run is on a fresh instance of the same VM type, all three arms together; absolute latencies there are lower than in the other experiments.
 
+**Update (behaviour changed after these runs).** The enforced-quota arm slept on the connection's reader while waiting for tokens, so the debt never grew and nothing was refused. Throttled requests are now dispatched by a timer while the connection keeps being read, so a request that would wait past `-max-quota-wait` is refused at once. Re-measured on the shape arm only (2 repetitions, noisy client allowed 4,096 requests in flight so the client itself does not queue): noisy tenant p50 / p99 **283 / 434-450 ms** (was 44 s / 89 s with the same client), about 26,600 requests refused, admitted load about 624 RU/s against the 600 quota, victim burst-window p99 2.6-3.4 ms. The table above (and the 89 s / 0 refused figures in the paragraph before) are the original measurement of the earlier behaviour and are stale for the current code; the re-measurement is a single short run of the shape arm, not committed under `results/`. With the default 256-worker `hkload` the noisy client's own backlog still shows up as a 23.8 s p99, so the 4,096-worker setting is the fair comparison. The same change also keeps each client connection's pipelined commands in order on one backend connection per shard.
+
 ## Two mistakes the benchmarks caught
 
 - **Write combining on by default.** The first full run had a 2 ms combining window on by default, and the hot-key proxy looked *slower* than the plain proxy: p50 rose with skew to 2.7 ms. A combined write holds its connection's reply queue for the window, and every pipelined read behind it waits (head-of-line blocking). Caching and combining are now separate (combining opt-in, measured on its own); the original runs are not used. `docs/DESIGN.md` section 5.
-- **Fair queueing that did not isolate.** The first isolation build only deprioritised over-quota requests (ABase-style soft quota with weighted fair queueing per shard). It changed nothing for the victim, because the interference was not queueing at a shard. Enforced quotas were added, and E5 compares all three arms. The enforced arm then showed a second problem (refusal never triggered, so the throttled tenant's backlog grew without bound); that one is documented, not fixed.
+- **Fair queueing that did not isolate.** The first isolation build only deprioritised over-quota requests (ABase-style soft quota with weighted fair queueing per shard). It changed nothing for the victim, because the interference was not queueing at a shard. Enforced quotas were added, and E5 compares all three arms. The enforced arm then showed a second problem (refusal never triggered, so the throttled tenant's backlog grew without bound); that one was fixed later (update under the E5 table).
 
 ## What is here
 
@@ -63,6 +65,24 @@ cmd/hkload   open-loop load generator: live-room and leaderboard mixes, direct /
              limited fan-out groups, tenants and bursts, lost-write check
 bench/     cluster.sh (3-shard Redis Cluster), run_all.sh, plot.py
 ```
+
+## Quick start
+
+Needs Go 1.24+, and `redis-server` 7 with `redis-cli` for the cluster:
+
+```
+git clone https://github.com/athish-shubhan/hotkeyproxy && cd hotkeyproxy
+go test -race ./...                        # TestAgainstRealRedis runs when redis-server is on PATH, skips otherwise
+bench/cluster.sh start                     # 3-shard Redis Cluster on 127.0.0.1:7001-7003
+go run ./cmd/hkproxy -seed 127.0.0.1:7001  # proxy on 127.0.0.1:7100, stats on 127.0.0.1:7200
+redis-cli -p 7100 INCR room:1:likes        # in another shell
+curl -s 127.0.0.1:7200                     # proxy stats (JSON)
+bench/cluster.sh stop
+```
+
+A shard that stops answering turns into `ERR proxy: backend reply timeout` after `-backend-timeout` (default 5s) and its connection is re-established, instead of every request to it waiting forever.
+
+CI (`.github/workflows/ci.yml`) runs gofmt, `go mod tidy -diff`, `go vet`, `go test -race` with Redis 7 installed, and golangci-lint on every pull request.
 
 ## Reproduce
 

@@ -10,8 +10,10 @@ package proxy
 //     second of quota). By default a request that finds the bucket empty is
 //     not rejected; it is scheduled at a tenth of its tenant's weight, so a
 //     tenant over quota gets only what the others leave unused (soft). With
-//     QuotaShape the quota is enforced: the request waits for tokens on its
-//     own connection, or is refused if the wait would exceed MaxQuotaWait.
+//     QuotaShape the quota is enforced: the request is dispatched once its
+//     tokens are earned, or refused at once if that would take longer than
+//     MaxQuotaWait. The connection keeps being read meanwhile, so a client
+//     sending faster than its quota gets refusals, not an unbounded queue.
 //   - Layer 2, per shard: weighted fair queueing in front of each Redis
 //     shard. At most MaxInFlight requests per shard are outstanding (Redis
 //     executes one connection's commands in order, so anything already sent
@@ -142,8 +144,8 @@ type fqItem struct {
 	finish, start float64
 	seq           uint64
 	enc           []byte
+	lane          uint64 // backend connection affinity (one client connection)
 	out           chan backend.Result
-	tenant        *Tenant
 }
 
 type fqHeap []*fqItem
@@ -174,14 +176,11 @@ type wfq struct {
 	seq      uint64
 	h        fqHeap
 	Queued   atomic.Int64
-
-	// onDispatch, when set (tests), is called as each request is sent to the shard.
-	onDispatch func(t *Tenant)
 }
 
 func newWFQ(srv *backend.Server, shard, max int) *wfq { return &wfq{srv: srv, shard: shard, max: max} }
 
-func (q *wfq) submit(t *Tenant, cost float64, enc []byte) <-chan backend.Result {
+func (q *wfq) submit(t *Tenant, cost float64, enc []byte, lane uint64) <-chan backend.Result {
 	now := time.Now()
 	t.mu.Lock()
 	w := t.cfg.Weight
@@ -190,23 +189,26 @@ func (q *wfq) submit(t *Tenant, cost float64, enc []byte) <-chan backend.Result 
 		t.OverQuota.Add(1)
 	}
 	t.mu.Unlock()
-	return q.enqueue(t, cost, enc, w)
+	return q.enqueue(t, cost, enc, w, lane)
 }
 
 // enqueue places a request in the shard's fair queue at weight w.
-func (q *wfq) enqueue(t *Tenant, cost float64, enc []byte, w float64) <-chan backend.Result {
+// A tenant's requests on a shard leave the queue in arrival order (their
+// finish times only grow), and lane keeps one client connection's requests
+// on one backend connection, so they run on Redis in the order sent.
+func (q *wfq) enqueue(t *Tenant, cost float64, enc []byte, w float64, lane uint64) <-chan backend.Result {
 	out := make(chan backend.Result, 1)
 	q.mu.Lock()
 	start := math.Max(q.vtime, t.lastFinishAt(q.shard))
-	it := &fqItem{start: start, finish: start + cost/w, enc: enc, out: out, tenant: t}
+	it := &fqItem{start: start, finish: start + cost/w, enc: enc, lane: lane, out: out}
 	t.setLastFinish(q.shard, it.finish)
 	q.seq++
 	it.seq = q.seq
 	if q.inflight < q.max && len(q.h) == 0 {
 		q.inflight++
 		q.vtime = start
+		q.dispatchLocked(it)
 		q.mu.Unlock()
-		q.dispatch(it)
 		return out
 	}
 	heap.Push(&q.h, it)
@@ -227,11 +229,14 @@ func (t *Tenant) setLastFinish(shard int, f float64) {
 	t.mu.Unlock()
 }
 
-func (q *wfq) dispatch(it *fqItem) {
-	if q.onDispatch != nil {
-		q.onDispatch(it.tenant)
-	}
-	ch := q.srv.Go(it.enc)
+// dispatchLocked hands it to the backend; q.mu must be held. Handing over
+// under the lock keeps the backend order equal to the queue's pop order:
+// handing over after unlocking let two completions race, so a client's
+// pipelined requests could reach Redis reversed. The hand-over is a send on
+// a buffered channel and the backend never takes q.mu, so this cannot
+// deadlock.
+func (q *wfq) dispatchLocked(it *fqItem) {
+	ch := q.srv.GoLane(it.lane, it.enc)
 	go func() {
 		r := <-ch
 		it.out <- r
@@ -241,9 +246,7 @@ func (q *wfq) dispatch(it *fqItem) {
 			nx := heap.Pop(&q.h).(*fqItem)
 			q.vtime = math.Max(q.vtime, nx.start)
 			q.inflight++
-			q.mu.Unlock()
-			q.dispatch(nx)
-			return
+			q.dispatchLocked(nx)
 		}
 		q.mu.Unlock()
 	}()

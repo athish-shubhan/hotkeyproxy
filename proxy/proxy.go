@@ -20,6 +20,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -58,12 +59,15 @@ type Config struct {
 	// connection), and is refused if it would wait longer than MaxQuotaWait.
 	QuotaShape   bool
 	MaxQuotaWait time.Duration
+	// BackendTimeout fails requests whose shard has not replied for this
+	// long (the shard connection is then re-established); 0 = wait forever.
+	BackendTimeout time.Duration
 }
 
 func DefaultConfig() Config {
 	return Config{Listen: "127.0.0.1:7100", StatsAddr: "127.0.0.1:7200", Seed: "127.0.0.1:7001", ConnsPerShard: 4,
 		Hot: true, HotThreshold: 200, HalfLife: time.Second, Staleness: 50 * time.Millisecond, CacheEntries: 4096,
-		CombineWindow: 0, Sample: 1, MaxInFlight: 16}
+		CombineWindow: 0, Sample: 1, MaxInFlight: 16, BackendTimeout: 5 * time.Second}
 }
 
 type Stats struct {
@@ -95,6 +99,7 @@ type Proxy struct {
 	comb    *combiner
 	S       Stats
 	sampleN atomic.Uint64
+	laneSeq atomic.Uint64 // one lane per client connection
 
 	tmu     sync.Mutex
 	tenants map[string]*Tenant
@@ -122,9 +127,43 @@ func (p *Proxy) tenant(name string) *Tenant {
 	return t
 }
 
+// Validate reports settings that would make the proxy misbehave instead of
+// fail: Sample 0 means no key is ever hot, ConnsPerShard 0 used to divide by
+// zero on the first request.
+func (c Config) Validate() error {
+	switch {
+	case c.Seed == "":
+		return fmt.Errorf("proxy: no seed node")
+	case c.ConnsPerShard < 1:
+		return fmt.Errorf("proxy: ConnsPerShard must be at least 1, got %d", c.ConnsPerShard)
+	case c.Sample < 1:
+		return fmt.Errorf("proxy: Sample must be at least 1, got %d", c.Sample)
+	case c.Hot && (c.HotThreshold <= 0 || c.HalfLife <= 0 || c.Staleness <= 0 || c.CacheEntries < 1):
+		return fmt.Errorf("proxy: hot-key handling needs HotThreshold, HalfLife, Staleness and CacheEntries > 0")
+	case c.CombineWindow < 0:
+		return fmt.Errorf("proxy: negative CombineWindow")
+	case c.Isolation && c.MaxInFlight < 1:
+		return fmt.Errorf("proxy: MaxInFlight must be at least 1 with isolation")
+	case c.QuotaShape && !c.Isolation:
+		return fmt.Errorf("proxy: QuotaShape needs Isolation")
+	case c.BackendTimeout < 0:
+		return fmt.Errorf("proxy: negative BackendTimeout")
+	}
+	for _, t := range c.Tenants {
+		if t.Name == "" || t.QuotaRU < 0 || t.Weight <= 0 {
+			return fmt.Errorf("proxy: tenant %q needs a name, QuotaRU >= 0 and Weight > 0", t.Name)
+		}
+	}
+	return nil
+}
+
 func New(cfg Config) (*Proxy, error) {
-	seed := backend.NewServer(cfg.Seed, 1)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	seed := backend.NewServerOptions(cfg.Seed, 1, backend.Options{ReadTimeout: cfg.BackendTimeout})
 	rep, err := seed.Do(resp.AppendCommand(nil, []byte("CLUSTER"), []byte("SLOTS")))
+	seed.Close() // only needed for the slot map; it used to reconnect forever
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +173,7 @@ func New(cfg Config) (*Proxy, error) {
 	}
 	p := &Proxy{cfg: cfg, slots: m}
 	for _, a := range m.Addrs {
-		p.servers = append(p.servers, backend.NewServer(a, cfg.ConnsPerShard))
+		p.servers = append(p.servers, backend.NewServerOptions(a, cfg.ConnsPerShard, backend.Options{ReadTimeout: cfg.BackendTimeout}))
 	}
 	p.tenants = map[string]*Tenant{}
 	for i, sv := range p.servers {
@@ -157,9 +196,15 @@ func (p *Proxy) ListenAndServe() error {
 		mux.HandleFunc("/", p.statsHandler)
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		// Bind before serving clients: a taken stats port used to be
+		// ignored silently, and the benchmark then read no stats.
+		sl, err := net.Listen("tcp", p.cfg.StatsAddr)
+		if err != nil {
+			return fmt.Errorf("stats listener: %w", err)
+		}
+		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		go func() {
-			srv := &http.Server{Addr: p.cfg.StatsAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-			if err := srv.ListenAndServe(); err != nil {
+			if err := srv.Serve(sl); err != nil {
 				log.Printf("stats server: %v", err)
 			}
 		}()
@@ -174,7 +219,7 @@ func (p *Proxy) ListenAndServe() error {
 			return err
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
-			tc.SetNoDelay(true)
+			_ = tc.SetNoDelay(true) // Go's default already; best effort
 		}
 		go p.serve(c)
 	}
@@ -217,6 +262,27 @@ func (r reply) wait() []byte {
 type connState struct {
 	noCache bool
 	tenant  *Tenant
+	// lane pins the connection's requests to one backend connection per
+	// shard, so Redis runs them in the order the client sent them
+	lane uint64
+	// closed when this connection's latest deferred (quota-throttled)
+	// request has been handed to its shard queue; later requests on the
+	// connection are dispatched after it so they reach Redis in order
+	lastDispatch chan struct{}
+}
+
+// dispatched reports whether the connection has no deferred request still
+// waiting to be handed to a shard queue.
+func (st *connState) dispatched() bool {
+	if st.lastDispatch == nil {
+		return true
+	}
+	select {
+	case <-st.lastDispatch:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *Proxy) serve(nc net.Conn) {
@@ -243,7 +309,7 @@ func (p *Proxy) serve(nc net.Conn) {
 		}
 		w.Flush()
 	}()
-	st := connState{tenant: p.tenant("")}
+	st := connState{tenant: p.tenant(""), lane: p.laneSeq.Add(1)}
 	for {
 		args, err := r.ReadCommand()
 		if err != nil || len(args) == 0 {
@@ -410,15 +476,39 @@ func (p *Proxy) forward(st *connState, shard int, enc []byte, cmd string) reply 
 			t.Refused.Add(1)
 			return reply{raw: resp.AppendError(nil, "ERR tenant over RU quota")}
 		}
-		if wait > 0 {
-			t.Throttled.Add(1)
-			time.Sleep(wait)
+		if wait > 0 || !st.dispatched() {
+			// Dispatch later without blocking this connection's reader. It
+			// used to sleep here, so the reader stopped reading, the tenant's
+			// debt never exceeded one request, nothing was ever refused, and
+			// the backlog grew in the socket instead (README E5: 0 refused,
+			// p99 89 s). Now the reader keeps reserving, the debt grows, and
+			// requests that would wait past MaxQuotaWait are refused at once.
+			// Dispatch times increase with the debt, so the connection's
+			// commands still reach Redis in order; replies are written in
+			// order by the connection's writer.
+			if wait > 0 {
+				t.Throttled.Add(1)
+			}
+			later := make(chan backend.Result, 1)
+			q := p.fq[shard]
+			prev, done, lane := st.lastDispatch, make(chan struct{}), st.lane
+			st.lastDispatch = done
+			time.AfterFunc(wait, func() {
+				if prev != nil {
+					<-prev
+				}
+				c := q.enqueue(t, cost, enc, t.cfg.Weight, lane)
+				close(done)
+				later <- <-c
+			})
+			ch = later
+		} else {
+			ch = p.fq[shard].enqueue(t, cost, enc, t.cfg.Weight, st.lane)
 		}
-		ch = p.fq[shard].enqueue(t, cost, enc, t.cfg.Weight)
 	} else if p.cfg.Isolation {
-		ch = p.fq[shard].submit(t, t.estimate(cmd, len(enc)), enc)
+		ch = p.fq[shard].submit(t, t.estimate(cmd, len(enc)), enc, st.lane)
 	} else {
-		ch = p.servers[shard].Go(enc)
+		ch = p.servers[shard].GoLane(st.lane, enc)
 	}
 	return reply{ch: ch, acct: t, cmd: cmd, write: write, reqLen: len(enc)}
 }

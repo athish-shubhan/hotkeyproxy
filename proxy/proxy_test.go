@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"fmt"
 	"net"
 	"sort"
 	"strconv"
@@ -25,6 +26,10 @@ type fakeRedis struct {
 	zsets map[string]map[string]float64
 	calls atomic.Int64
 	incrs atomic.Int64
+	// gate, when set, holds every command until it is closed; arrivals
+	// records GET keys in the order the backend received them.
+	gate     chan struct{}
+	arrivals []string
 }
 
 func startFake(t *testing.T) *fakeRedis {
@@ -59,6 +64,15 @@ func (f *fakeRedis) serve(c net.Conn) {
 		f.calls.Add(1)
 		cmd := strings.ToUpper(string(args[0]))
 		f.mu.Lock()
+		gate := f.gate
+		f.mu.Unlock()
+		if gate != nil && cmd != "CLUSTER" {
+			<-gate
+		}
+		f.mu.Lock()
+		if cmd == "GET" {
+			f.arrivals = append(f.arrivals, string(args[1]))
+		}
 		var out []byte
 		switch cmd {
 		case "CLUSTER":
@@ -233,7 +247,12 @@ func TestCrossSlotRejected(t *testing.T) {
 }
 
 // With one request in flight per shard, a victim's request submitted behind
-// a noisy tenant's queue of heavy requests is dispatched almost at once.
+// a noisy tenant's queue of heavy requests is the next one dispatched.
+//
+// The backend is held until everything is queued, and the order is read from
+// what the backend received. The old version raced the backend against the
+// submit loop and read completion order from goroutines, and failed about 1
+// run in 6 under -race.
 func TestFairQueueServesVictimFirst(t *testing.T) {
 	f := startFake(t)
 	p := newProxy(t, f, func(c *Config) {
@@ -241,42 +260,32 @@ func TestFairQueueServesVictimFirst(t *testing.T) {
 		c.Isolation = true
 		c.MaxInFlight = 1
 	})
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.gate = gate
+	f.mu.Unlock()
 	noisy, victim := p.tenant("noisy"), p.tenant("victim")
 	q := p.fq[0]
-	enc := resp.AppendCommand(nil, []byte("GET"), []byte("k"))
-	var mu sync.Mutex
-	var order []string // dispatch order to the shard
-	q.onDispatch = func(t *Tenant) {
-		mu.Lock()
-		order = append(order, t.Name())
-		mu.Unlock()
-	}
 	var chans []<-chan backend.Result
 	for i := 0; i < 200; i++ {
-		chans = append(chans, q.submit(noisy, 8, enc)) // heavy: 8 RU each
+		chans = append(chans, q.submit(noisy, 8, resp.AppendCommand(nil, []byte("GET"), []byte(fmt.Sprint("n", i))), 1)) // heavy: 8 RU each
 	}
-	mu.Lock()
-	before := len(order) // noisy requests already sent when the victim arrives
-	mu.Unlock()
-	chans = append(chans, q.submit(victim, 1, enc))
+	chans = append(chans, q.submit(victim, 1, resp.AppendCommand(nil, []byte("GET"), []byte("victim")), 2))
+	close(gate)
 	for _, ch := range chans {
-		<-ch
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(order) != 201 {
-		t.Fatalf("dispatched %d requests", len(order))
-	}
-	for i, n := range order {
-		if n == "victim" {
-			// at most the request in flight (plus a little scheduling slack) goes first
-			if i > before+2 {
-				t.Fatalf("victim dispatched %dth of %d (%d noisy already sent)", i+1, len(order), before)
-			}
-			return
+		if r := <-ch; r.Err != nil {
+			t.Fatal(r.Err)
 		}
 	}
-	t.Fatal("victim never dispatched")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.arrivals) != 201 {
+		t.Fatalf("backend saw %d GETs, want 201", len(f.arrivals))
+	}
+	// arrivals[0] is the noisy request already in flight when the rest queued
+	if f.arrivals[0] != "n0" || f.arrivals[1] != "victim" {
+		t.Fatalf("dispatch order starts %v, want [n0 victim ...]", f.arrivals[:5])
+	}
 }
 
 func TestRUCharging(t *testing.T) {
@@ -309,4 +318,110 @@ func TestTenantReserve(t *testing.T) {
 	if w, ok := tn.reserve(80, now.Add(time.Second), 200*time.Millisecond); !ok || w != 0 {
 		t.Fatalf("after refill: wait %v ok %v", w, ok)
 	}
+}
+
+// A shard that stops answering turns into an error reply after
+// BackendTimeout instead of a client that waits forever, and requests work
+// again once the shard answers.
+func TestBackendTimeoutBecomesErrorReply(t *testing.T) {
+	f := startFake(t)
+	p := newProxy(t, f, func(c *Config) {
+		c.Hot = false
+		c.BackendTimeout = 200 * time.Millisecond
+	})
+	if got := string(do(p, "GET", "k")); strings.HasPrefix(got, "-") {
+		t.Fatalf("healthy shard: %q", got)
+	}
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.gate = gate
+	f.mu.Unlock()
+	start := time.Now()
+	got := string(do(p, "GET", "k"))
+	if !strings.HasPrefix(got, "-ERR proxy: backend reply timeout") {
+		t.Fatalf("got %q", got)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("took %v", d)
+	}
+	f.mu.Lock()
+	f.gate = nil
+	f.mu.Unlock()
+	close(gate)
+	var ok bool
+	for i := 0; i < 50 && !ok; i++ { // the shard connection is re-established
+		ok = !strings.HasPrefix(string(do(p, "GET", "k")), "-")
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("requests did not recover after the shard answered again")
+	}
+}
+
+// A client sending faster than its quota on one pipelined connection gets
+// refusals within MaxQuotaWait, not an unbounded queue: 300 one-RU GETs at a
+// 100 RU/s quota used to be all admitted, one per 10 ms, the last one about
+// 2 s late, and none refused.
+func TestQuotaRefusesInsteadOfQueueing(t *testing.T) {
+	f := startFake(t)
+	listen := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	p := newProxy(t, f, func(c *Config) {
+		c.Hot = false
+		c.Isolation = true
+		c.QuotaShape = true
+		c.MaxQuotaWait = 200 * time.Millisecond
+		c.Tenants = []TenantConfig{{Name: "noisy", QuotaRU: 100, Weight: 1}}
+		c.Listen = listen
+		c.StatsAddr = ""
+	})
+	go func() { _ = p.ListenAndServe() }()
+	c := dial(t, listen)
+	if r := c.do("AUTH", "noisy"); string(r.Raw) != "+OK\r\n" {
+		t.Fatalf("AUTH: %q", r.Raw)
+	}
+	const n = 300
+	var batch []byte
+	for i := 0; i < n; i++ {
+		batch = resp.AppendCommand(batch, []byte("GET"), []byte(fmt.Sprintf("k%03d", i)))
+	}
+	start := time.Now()
+	if _, err := c.c.Write(batch); err != nil {
+		t.Fatal(err)
+	}
+	ok, refused := 0, 0
+	for i := 0; i < n; i++ {
+		rep, err := c.r.ReadReply()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case rep.Type == '-' && strings.Contains(string(rep.Raw), "over RU quota"):
+			refused++
+		case rep.Type == '$':
+			ok++
+		default:
+			t.Fatalf("reply %d: %q", i, rep.Raw)
+		}
+	}
+	took := time.Since(start)
+	// the bucket starts full (100 RU) and refills 100 RU/s; with a 200 ms
+	// limit about 120 requests fit, the rest are refused at once
+	if refused == 0 || ok < 100 || ok > 160 {
+		t.Fatalf("ok %d refused %d", ok, refused)
+	}
+	if took > time.Second {
+		t.Fatalf("took %v: requests queued past MaxQuotaWait", took)
+	}
+	// admitted commands reached Redis in the order they were sent
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := 1; i < len(f.arrivals); i++ {
+		if f.arrivals[i] < f.arrivals[i-1] {
+			t.Fatalf("out of order at %d: %s after %s", i, f.arrivals[i], f.arrivals[i-1])
+		}
+	}
+	if len(f.arrivals) != ok {
+		t.Fatalf("backend saw %d GETs, %d admitted", len(f.arrivals), ok)
+	}
+	t.Logf("%d admitted, %d refused, %v", ok, refused, took)
 }
